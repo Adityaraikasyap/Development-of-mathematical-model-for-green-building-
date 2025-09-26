@@ -1,0 +1,537 @@
+% Room_6_Sides_from_single_wall.m
+% Converted from single-wall 2D FDM to a closed room with 6 surfaces (4 walls + ceiling + floor).
+% Minimal changes from original code: each surface uses the same FDM logic and PCM placement.
+% Solar applied only to South wall and Roof. Indoor air is lumped and sealed (ACH = 0).
+
+% Clear workspace and close all figures for a clean start
+clc;
+clear;
+close all;
+
+%% --- Load the Excel file ---
+% IMPORTANT: The script will now prompt you to select the Excel file.
+% This script assumes the file has Solar Radiation in column 1,
+% Ambient Temperature in column 2, and Measured Indoor Temperature (MS2) in column 7.
+[file, path] = uigetfile('*.xlsx', 'Select Excel file with solar radiation, ambient temp, and measured data');
+if isequal(file, 0)
+    error('No file selected. Please select a valid Excel file.');
+end
+fullpath = fullfile(path, file);
+
+data = readtable(fullpath);
+Solar_rad_all = data{:,1}; % W/m²
+Ambient_temp_all = data{:,2}; % °C
+
+% Load measured data for initial condition and comparison (MS2, Column 7)
+try
+    Measured_T_indoor_MS2_all = data{:,7}; % °C
+    disp('Measured temperature data loaded for initial condition and comparison (MS2).');
+    initial_temp = Measured_T_indoor_MS2_all(1);
+catch
+    warning('Could not load measured data from column 7 (MS2). Using initial ambient temperature for initial condition.');
+    initial_temp = Ambient_temp_all(1);
+end
+
+% Time vector from the original data file
+time_hours_raw = (0:length(Solar_rad_all)-1) * 0.8; % Assuming 0.8 hr interval
+if size(time_hours_raw,1) > 1; time_hours_raw = time_hours_raw'; end
+
+%% ---------------- Room geometry (used for surface areas) ----------------
+% Room size as you previously confirmed
+room_L = 3.0;   % m (length, East-West)
+room_W = 3.0;   % m (width, North-South)
+room_H = 2.5;   % m (height)
+
+%% GLOBAL PARAMETERS (2D Adaptations)
+L_x = 0.10;     % Wall thickness in x-direction [m] (same for all surfaces)
+% Note: for each surface we will set L_y equal to that surface's height dimension.
+Nx = 30;        % Number of nodes in x-direction (thickness) - same for all surfaces
+Ny = 100;       % Number of nodes in y-direction (along the surface) - same for all surfaces
+dx = L_x / Nx;  % Node spatial step in x [m]
+dt = 1;         % Time step [s] - keep small for explicit stability, may need to reduce if unstable
+t_end = 72*3600; % 72 hours simulation
+
+%% Material properties (unchanged)
+% Brick Properties
+k_brick = 0.5;      % [W/m.K]
+rho_brick = 2100;   % [kg/m³]
+cp_brick = 900;     % [J/kg.K]
+
+% Mortar Properties
+k_mortar = 0.7;     % [W/m.K]
+rho_mortar = 2000;  % [kg/m³]
+cp_mortar = 880;    % [J/kg.K]
+
+% PCM Properties
+k_pcm = 0.27;       % [W/m.K]
+rho_pcm = (1086 + 899) / 2; % [kg/m³] (average of solid and liquid densities)
+cp_pcm = (2120 + 2680) / 2; % [J/kg.K] (average of solid and liquid specific heats)
+L_latent = 242e3;   % [J/kg] (latent heat of fusion)
+T_melt_start = 28;  % [°C] (start of melting temperature range)
+T_melt_end = 39;    % [°C] (end of melting temperature range)
+
+%% Boundary & Environment Parameters (unchanged except ACH set to 0 for closed room)
+h_ext = 15;         % External convective coeff [W/m².K]
+h_int = 5;          % Internal convective coeff [W/m².K]
+sigma = 5.67e-8;    % Stefan-Boltzmann constant
+eps_wall = 0.9;     % Emissivity of wall surface
+alpha_surf = 0.6;   % Solar absorptivity
+
+% Indoor air properties
+V_air_room = room_L * room_W * room_H; % room volume
+rho_air = 1.2; cp_air = 1005; % Density and specific heat of air
+m_air = V_air_room * rho_air; % Mass of air in the room
+ACH = 0;            % Air Changes per Hour -> sealed room
+m_dot_air = ACH * V_air_room * rho_air / 3600; % [kg/s] (zero for sealed)
+Q_internal = 0;    % Internal heat gain [W] (unchanged)
+
+% Calculate effective specific heat capacity for latent heat
+delta_T_melt = T_melt_end - T_melt_start;
+if delta_T_melt <= 0
+    error('PCM melting range cannot be zero or negative. T_melt_end must be greater than T_melt_start.');
+end
+Cp_eff_latent = L_latent / delta_T_melt;
+
+%% Time Discretization and Data Interpolation
+t_fine = 0:dt:t_end; % Fine time vector for simulation
+t_fine_hours = t_fine/3600; % Time vector in hours
+Nt = length(t_fine); % Number of time steps
+
+% Interpolate input data to match the simulation's fine time steps
+Solar_rad = interp1(time_hours_raw, Solar_rad_all, t_fine_hours, 'linear', 'extrap');
+T_ambient = interp1(time_hours_raw, Ambient_temp_all, t_fine_hours, 'linear', 'extrap');
+T_measured_interp = interp1(time_hours_raw*3600, Measured_T_indoor_MS2_all, t_fine, 'linear', 'extrap');
+
+%% Define 6 surfaces and which receive solar
+% We'll keep the same PCM-location options and same per-surface logic.
+% Each surface will have: name, plane_dims [height, width], solar_flag (1 if receives solar), and L_y for that surface.
+surfaces = struct();
+
+% Convention: For each surface, plane_dims = [height, width]
+% Wall East (facing +x): height x room_W? We'll set width = room_W (since east/west walls span north-south)
+surfaces(1).name = 'Wall_East';
+surfaces(1).plane_dims = [room_H, room_W];
+surfaces(1).solar_flag = 0; % no solar
+
+% Wall West (-x)
+surfaces(2).name = 'Wall_West';
+surfaces(2).plane_dims = [room_H, room_W];
+surfaces(2).solar_flag = 0; % no solar
+
+% Wall North (+y)
+surfaces(3).name = 'Wall_North';
+surfaces(3).plane_dims = [room_H, room_L];
+surfaces(3).solar_flag = 0; % no solar
+
+% Wall South (-y) -> receives solar per your request
+surfaces(4).name = 'Wall_South';
+surfaces(4).plane_dims = [room_H, room_L];
+surfaces(4).solar_flag = 1; % solar applied
+
+% Ceiling (roof) -> receives solar per your request
+surfaces(5).name = 'Ceiling';
+surfaces(5).plane_dims = [room_L, room_W]; % treat as plane height x width (use first entry as "height" for grid)
+surfaces(5).solar_flag = 1;
+
+% Floor -> no solar (interacts with ground, but we treat exterior as no solar)
+surfaces(6).name = 'Floor';
+surfaces(6).plane_dims = [room_L, room_W];
+surfaces(6).solar_flag = 0;
+
+num_surfaces = length(surfaces);
+
+% For each surface compute L_y (height of slab for plotting/area), Ny effective dy
+for s = 1:num_surfaces
+    surfaces(s).L_y = surfaces(s).plane_dims(1); % use first dimension as "height" for that surface
+    surfaces(s).area_total = surfaces(s).plane_dims(1) * surfaces(s).plane_dims(2);
+    surfaces(s).Ny = Ny;       % use same Ny as original
+    surfaces(s).Nx = Nx;       % same Nx
+    surfaces(s).dx = dx;       % same dx
+    surfaces(s).dy = surfaces(s).L_y / surfaces(s).Ny;
+end
+
+%% --- Stability Check for Explicit Finite Difference Scheme (global check) ---
+alpha_min = min([k_brick/(rho_brick*cp_brick), k_mortar/(rho_mortar*cp_mortar), k_pcm/(rho_pcm*cp_pcm)]);
+dy_min = min([surfaces.dy]);
+stability_condition = alpha_min * dt * (1/dx^2 + 1/dy_min^2);
+if stability_condition > 0.5
+    warning('Explicit finite difference scheme may be unstable. Stability condition alpha*dt*(1/dx^2 + 1/dy^2) = %.4f. Consider reducing dt.', stability_condition);
+end
+
+%% Pre-allocate storage for results (one simulated indoor series per PCM-location scenario)
+pcm_locations = {'Exterior', 'Middle', 'Interior'};
+num_locations = length(pcm_locations);
+
+all_sim_T_indoor_air = zeros(Nt, num_locations); % will store indoor T for each PCM loc scenario
+all_RME = zeros(1, num_locations);
+all_RAE = zeros(1, num_locations);
+all_RMSE = zeros(1, num_locations);
+all_D_val_MS2 = zeros(1, num_locations);
+all_SD_val_MS2 = zeros(1, num_locations);
+all_LoA_lower_MS2 = zeros(1, num_locations);
+all_LoA_upper_MS2 = zeros(1, num_locations);
+
+%% Loop through each PCM location scenario (apply same logic to all 6 surfaces)
+for loc_idx = 1:num_locations
+    pcm_location_type = pcm_locations{loc_idx};
+    
+    % Initialize per-surface temperature fields (cell array of 2D matrices)
+    T_wall_cells = cell(num_surfaces,1);
+    for s = 1:num_surfaces
+        T_wall_cells{s} = ones(surfaces(s).Ny, surfaces(s).Nx) * initial_temp; % initialize with initial temp
+    end
+
+    % Prepare material maps per surface (will be created inside time loop to keep code similar)
+    % Initialize indoor air time series for this scenario
+    T_indoor_air_sim_current = zeros(Nt,1);
+    T_indoor_air_sim_current(1) = initial_temp;
+
+    fprintf('\nStarting 2D closed-room simulation for PCM location: %s\n', pcm_location_type);
+    for n = 1:Nt
+        current_Solar_rad = Solar_rad(n);
+        current_T_ambient = T_ambient(n);
+        T_sky = current_T_ambient - 6; % sky temp approx
+        
+        % total convective heat from all interior surfaces for this timestep (W)
+        Q_conv_total_to_air = 0;
+        Q_window_solar_total = 0; % (if you want to treat windows; kept zero as original had no explicit windows)
+        
+        % Loop over surfaces and update each as a 2D wall slab
+        for s = 1:num_surfaces
+            Ny_s = surfaces(s).Ny;
+            Nx_s = surfaces(s).Nx;
+            dx_s = surfaces(s).dx;
+            dy_s = surfaces(s).dy;
+            L_y_s = surfaces(s).L_y; % length along surface (height)
+            
+            T_wall_old = T_wall_cells{s};
+            T_wall = T_wall_old; % will be updated
+            
+            % Create k_map, rho_map, cp_map same as original wall logic
+            k_map = zeros(Ny_s, Nx_s);
+            rho_map = zeros(Ny_s, Nx_s);
+            cp_map = zeros(Ny_s, Nx_s);
+            
+            mortar_Nx = max(1, round(Nx_s * 0.1));
+            brick_start_Nx = mortar_Nx + 1;
+            brick_end_Nx = Nx_s - mortar_Nx;
+            
+            for j = 1:Ny_s
+                % Outer mortar
+                k_map(j, 1:mortar_Nx) = k_mortar;
+                rho_map(j, 1:mortar_Nx) = rho_mortar;
+                cp_map(j, 1:mortar_Nx) = cp_mortar;
+                % Brick
+                if brick_start_Nx <= brick_end_Nx
+                    k_map(j, brick_start_Nx:brick_end_Nx) = k_brick;
+                    rho_map(j, brick_start_Nx:brick_end_Nx) = rho_brick;
+                    cp_map(j, brick_start_Nx:brick_end_Nx) = cp_brick;
+                end
+                % Inner mortar
+                k_map(j, brick_end_Nx+1:Nx_s) = k_mortar;
+                rho_map(j, brick_end_Nx+1:Nx_s) = rho_mortar;
+                cp_map(j, brick_end_Nx+1:Nx_s) = cp_mortar;
+            end
+            
+            % Place PCM using same pcm_thickness_nodes and location logic as original
+            pcm_thickness_nodes = 4; % same as original example (adjust if needed)
+            if pcm_thickness_nodes > Nx_s
+                error('PCM thickness nodes cannot exceed Nx for surface %d.', s);
+            end
+            
+            switch pcm_location_type
+                case 'Exterior'
+                    pcm_x_start = 1;
+                    pcm_x_end = pcm_x_start + pcm_thickness_nodes - 1;
+                case 'Middle'
+                    pcm_x_start = max(1, floor(Nx_s/2) - floor(pcm_thickness_nodes/2) + 1);
+                    pcm_x_end = min(Nx_s, pcm_x_start + pcm_thickness_nodes - 1);
+                case 'Interior'
+                    pcm_x_end = Nx_s;
+                    pcm_x_start = pcm_x_end - pcm_thickness_nodes + 1;
+                otherwise
+                    error('Invalid PCM location type specified.');
+            end
+            
+            % Apply PCM properties to the designated region
+            k_map(:, pcm_x_start:pcm_x_end) = k_pcm;
+            rho_map(:, pcm_x_start:pcm_x_end) = rho_pcm;
+            cp_map(:, pcm_x_start:pcm_x_end) = cp_pcm;
+            
+            % effective cp including latent where PCM is within melt range
+            cp_eff_current = cp_map;
+            for j_pcm = 1:Ny_s
+                for i_pcm = pcm_x_start:pcm_x_end
+                    T_pcm_node_old = T_wall_old(j_pcm,i_pcm);
+                    if T_pcm_node_old > T_melt_start && T_pcm_node_old < T_melt_end
+                        cp_eff_current(j_pcm,i_pcm) = cp_map(j_pcm,i_pcm) + Cp_eff_latent;
+                    end
+                end
+            end
+            
+            % --- FDM update for this surface ---
+            for j = 1:Ny_s
+                for i = 1:Nx_s
+                    k_node = k_map(j,i);
+                    rho_node = rho_map(j,i);
+                    cp_eff_node = cp_eff_current(j,i);
+                    CV_area = dx_s * dy_s; % projected area
+                    Q_sum = 0;
+                    
+                    % Internal nodes
+                    if i > 1 && i < Nx_s && j > 1 && j < Ny_s
+                        Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - 2*T_wall_old(j,i) + T_wall_old(j,i-1)) + ...
+                                k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - 2*T_wall_old(j,i) + T_wall_old(j-1,i));
+                    
+                    % Boundary nodes
+                    elseif i == 1 % exterior-facing surface (left edge)
+                        % external fluxes
+                        q_ext_conv = h_ext * (current_T_ambient - T_wall_old(j,i));
+                        % apply solar only if this surface's solar_flag==1
+                        if surfaces(s).solar_flag
+                            q_ext_solar = alpha_surf * current_Solar_rad;
+                        else
+                            q_ext_solar = 0;
+                        end
+                        q_ext_rad = eps_wall * sigma * ((T_sky+273.15)^4 - (T_wall_old(j,i)+273.15)^4);
+                        q_ext_total = q_ext_conv + q_ext_solar + q_ext_rad;
+                        
+                        if j == 1
+                            CV_area = (dx_s/2) * (dy_s/2);
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - T_wall_old(j,i)) + ...
+                                    q_ext_total * dy_s;
+                        elseif j == Ny_s
+                            CV_area = (dx_s/2) * (dy_s/2);
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j-1,i) - T_wall_old(j,i)) + ...
+                                    q_ext_total * dy_s;
+                        else
+                            CV_area = (dx_s/2) * dy_s;
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - 2*T_wall_old(j,i) + T_wall_old(j-1,i)) + ...
+                                    q_ext_total * dy_s;
+                        end
+                        
+                    elseif i == Nx_s % interior-facing surface (right edge)
+                        current_T_indoor_air = T_indoor_air_sim_current(max(1,n-1));
+                        q_int_conv = h_int * (current_T_indoor_air - T_wall_old(j,i));
+                        q_int_total = q_int_conv;
+                        
+                        if j == 1
+                            CV_area = (dx_s/2) * (dy_s/2);
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i-1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - T_wall_old(j,i)) + ...
+                                    q_int_total * dy_s;
+                        elseif j == Ny_s
+                            CV_area = (dx_s/2) * (dy_s/2);
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i-1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j-1,i) - T_wall_old(j,i)) + ...
+                                    q_int_total * dy_s;
+                        else
+                            CV_area = (dx_s/2) * dy_s;
+                            Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i-1) - T_wall_old(j,i)) + ...
+                                    k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - 2*T_wall_old(j,i) + T_wall_old(j-1,i)) + ...
+                                    q_int_total * dy_s;
+                        end
+                        
+                    elseif j == 1 && i > 1 && i < Nx_s % top edge (adiabatic)
+                        CV_area = dx_s * (dy_s/2);
+                        Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - 2*T_wall_old(j,i) + T_wall_old(j,i-1)) + ...
+                                k_node * (dx_s/dy_s) * (T_wall_old(j+1,i) - T_wall_old(j,i));
+                        
+                    elseif j == Ny_s && i > 1 && i < Nx_s % bottom edge (adiabatic)
+                        CV_area = dx_s * (dy_s/2);
+                        Q_sum = k_node * (dy_s/dx_s) * (T_wall_old(j,i+1) - 2*T_wall_old(j,i) + T_wall_old(j,i-1)) + ...
+                                k_node * (dx_s/dy_s) * (T_wall_old(j-1,i) - T_wall_old(j,i));
+                    end
+                    
+                    % Update temperature
+                    T_wall(j,i) = T_wall_old(j,i) + (dt / (rho_node * cp_eff_node * (CV_area))) * Q_sum;
+                end
+            end % end nodes loops
+            
+            % store updated surface
+            T_wall_cells{s} = T_wall;
+            
+            % compute average inner-surface temperature (interior-facing column)
+            avg_inner_surface = mean(T_wall(:, end));
+            
+            % convective heat from this surface to air: q'' = h_int*(T_surface - T_air)
+            current_T_air_prev = T_indoor_air_sim_current(max(1,n-1));
+            q_conv_surface = h_int * (avg_inner_surface - current_T_air_prev); % W/m2 (positive means surface -> air)
+            Q_conv_total_to_air = Q_conv_total_to_air + q_conv_surface * surfaces(s).area_total;
+            
+            % If solar incidents exist on this surface and you want to add window transmitted solar
+            % to internal gains, you could add it here (kept zero to stay close to original code).
+            % Q_window_solar_total = Q_window_solar_total + ... 
+        end % end surfaces loop
+        
+        % Total heat to indoor air (sum of convective from all surfaces + ventilation + internal)
+        Q_ventilation = m_dot_air * cp_air * (current_T_ambient - T_indoor_air_sim_current(max(1,n-1))); % zero since ACH=0
+        Q_total_to_air = Q_conv_total_to_air + Q_ventilation + Q_internal;
+        
+        % Update indoor air temperature (lumped capacitance)
+        T_indoor_air_sim_current(n) = T_indoor_air_sim_current(max(1,n-1)) + (dt / (m_air * cp_air)) * Q_total_to_air;
+        
+        % Optional: visualize one of the surfaces occasionally (e.g., south wall)
+        if mod(n, 3600*6) == 0 || n == Nt
+            % visualize South wall (surfaces(4)) temperature field as example
+            idx_plot = 4; % south
+            figure('Name', sprintf('Surface %s Temp (%.1f hrs), PCM %s', surfaces(idx_plot).name, t_fine_hours(n), pcm_location_type), 'NumberTitle', 'off');
+            imagesc([0 L_x], [0 surfaces(idx_plot).L_y], T_wall_cells{idx_plot});
+            colorbar;
+            axis xy;
+            colormap jet;
+            caxis([min(T_ambient)*0.9, max(T_ambient)*1.1]);
+            xlabel('Wall Thickness (m)');
+            ylabel('Surface Height (m)');
+            title(sprintf('%s Temperature (%.1f hrs), PCM %s', surfaces(idx_plot).name, t_fine_hours(n), pcm_location_type));
+            drawnow;
+        end
+    end % end time loop for this PCM location
+    
+    disp('2D closed-room simulation for this PCM scenario complete.');
+    
+    % store indoor air result for this pcm location
+    all_sim_T_indoor_air(:, loc_idx) = T_indoor_air_sim_current;
+    
+    % --- compute basic error metrics vs measured (if measured available) ---
+    T_sim_clean = T_indoor_air_sim_current(:);
+    T_measured_clean = T_measured_interp(:);
+    valid_idx = ~isnan(T_sim_clean) & ~isnan(T_measured_clean);
+    T_sim_clean = T_sim_clean(valid_idx);
+    T_measured_clean = T_measured_clean(valid_idx);
+    if isempty(T_sim_clean)
+        warning('No valid pairs for error metrics for PCM location %s', pcm_location_type);
+        RME = NaN; RAE = NaN; RMSE = NaN;
+        D_val_MS2 = NaN; SD_val_MS2 = NaN; LoA_lower_MS2 = NaN; LoA_upper_MS2 = NaN;
+    else
+        T_measured_clean(T_measured_clean < 0.1 & T_measured_clean >= 0) = 0.1;
+        [RME, RAE] = calculate_RME_RAE(T_sim_clean, T_measured_clean);
+        RMSE = sqrt(mean((T_sim_clean - T_measured_clean).^2));
+        [D_val_MS2, SD_val_MS2, LoA_lower_MS2, LoA_upper_MS2, ~, ~, ~, ~] = calculate_bland_altman_metrics(T_sim_clean, T_measured_clean);
+    end
+    
+    all_RME(loc_idx) = RME;
+    all_RAE(loc_idx) = RAE;
+    all_RMSE(loc_idx) = RMSE;
+    all_D_val_MS2(loc_idx) = D_val_MS2;
+    all_SD_val_MS2(loc_idx) = SD_val_MS2;
+    all_LoA_lower_MS2(loc_idx) = LoA_lower_MS2;
+    all_LoA_upper_MS2(loc_idx) = LoA_upper_MS2;
+    
+    % Plot simulated vs measured for this PCM scenario
+    figure('Name', sprintf('Simulated Indoor vs Measured (PCM %s)', pcm_location_type), 'NumberTitle', 'off');
+    plot(t_fine_hours, T_indoor_air_sim_current, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t_fine_hours, T_measured_interp, 'k--', 'LineWidth', 1.5);
+    xlabel('Time (hours)');
+    ylabel('Temperature (°C)');
+    title(sprintf('Simulated Indoor (PCM %s) vs Measured', pcm_location_type));
+    legend(sprintf('Simulated (PCM %s)', pcm_location_type), 'Measured (MS2)', 'Location', 'best');
+    grid on; xlim([0 t_end/3600]);
+    hold off;
+end % end pcm location loop
+
+%% ########################################################################
+% Plot all simulated indoor air temperatures vs measured and ambient
+figure('Name', 'Indoor Temperature Comparison (All PCM Scenarios)', 'NumberTitle', 'off');
+hold on;
+plot(t_fine_hours, T_measured_interp, 'k-', 'LineWidth', 2, 'DisplayName', 'Measured (MS2)');
+plot(t_fine_hours, T_ambient, 'r:', 'LineWidth', 1.5, 'DisplayName', 'Ambient Temperature');
+
+colors = {'b', 'g', 'm'}; % Colors for the three simulated lines
+for loc_idx = 1:num_locations
+    plot(t_fine_hours, all_sim_T_indoor_air(:, loc_idx), 'Color', colors{loc_idx}, 'LineWidth', 1.5, 'DisplayName', sprintf('Simulated (PCM %s)', pcm_locations{loc_idx}));
+end
+
+hold off;
+grid on;
+title('Simulated Indoor Air Temperature vs Measured for All PCM Locations (Closed Room)');
+xlabel('Time (hours)');
+ylabel('Temperature (°C)');
+legend('Location', 'best');
+xlim([0 t_end/3600]);
+set(gca, 'FontSize', 10);
+
+%% ########################################################################
+% Display final error metrics summary table
+fprintf('\n\n--- Summary of Error Analysis for All PCM Locations ---\n');
+fprintf('%-10s %-8s %-8s %-8s %-8s %-8s %-10s %-10s\n', ...
+    'PCM Loc.', 'RME (%)', 'RAE (%)', 'RMSE (°C)', 'Bias (°C)', 'SD (°C)', 'LoA Lower', 'LoA Upper');
+fprintf('------------------------------------------------------------------------------------------------\n');
+for loc_idx = 1:num_locations
+    fprintf('%-10s %-8.2f %-8.2f %-8.2f %-8.2f %-8.2f %-10.2f %-10.2f\n', ...
+        pcm_locations{loc_idx}, all_RME(loc_idx), all_RAE(loc_idx), all_RMSE(loc_idx), ...
+        all_D_val_MS2(loc_idx), all_SD_val_MS2(loc_idx), all_LoA_lower_MS2(loc_idx), all_LoA_upper_MS2(loc_idx));
+end
+fprintf('------------------------------------------------------------------------------------------------\n');
+
+%% ---------------- Helper functions (same as before) ----------------
+function [RME, RAE] = calculate_RME_RAE(sim_data, meas_data)
+    sim_data = sim_data(:);
+    meas_data = meas_data(:);
+    if length(sim_data) ~= length(meas_data)
+        error('Simulated and measured data must have the same length.');
+    end
+    valid_indices = ~isnan(sim_data) & ~isnan(meas_data) & (meas_data ~= 0);
+    if sum(valid_indices) == 0
+        warning('No valid data points (non-NaN, non-zero measured) for RME/RAE calculation. RME and RAE will be NaN.');
+        RME = NaN;
+        RAE = NaN;
+        return;
+    end
+    sim_data_valid = sim_data(valid_indices);
+    meas_data_valid = meas_data(valid_indices);
+    pointwise_relative_errors = abs((sim_data_valid - meas_data_valid) ./ meas_data_valid) * 100;
+    pointwise_relative_errors = pointwise_relative_errors(isfinite(pointwise_relative_errors));
+    if isempty(pointwise_relative_errors)
+        warning('No valid finite pointwise relative errors to calculate RME/RAE after isfinite check.');
+        RME = NaN;
+        RAE = NaN;
+        return;
+    end
+    RME = max(pointwise_relative_errors);
+    RAE = mean(pointwise_relative_errors);
+end
+
+function [D_val, SD_val, LoA_lower, LoA_upper, PCT1_val, D_max_abs_val, MNE_val, PCT2_val] = ...
+    calculate_bland_altman_metrics(sim_data, meas_data)
+    sim_data = sim_data(:);
+    meas_data = meas_data(:);
+    if length(sim_data) ~= length(meas_data)
+        error('Simulated and measured data must have the same length.');
+    end
+    valid_pair_indices = ~isnan(sim_data) & ~isnan(meas_data);
+    sim_data_valid = sim_data(valid_pair_indices);
+    meas_data_valid = meas_data(valid_pair_indices);
+    if isempty(sim_data_valid)
+        warning('No valid non-NaN data pairs for Bland-Altman calculation. All metrics will be NaN.');
+        D_val=NaN; SD_val=NaN; LoA_lower=NaN; LoA_upper=NaN; PCT1_val=NaN; D_max_abs_val=NaN; MNE_val=NaN; PCT2_val=NaN;
+        return;
+    end
+    differences = sim_data_valid - meas_data_valid;
+    D_val = mean(differences);
+    SD_val = std(differences);
+    if isnan(D_val) || isnan(SD_val) || length(differences) < 2
+        LoA_lower = NaN; LoA_upper = NaN; PCT1_val = NaN;
+    else
+        LoA_lower = D_val - 1.96 * SD_val;
+        LoA_upper = D_val + 1.96 * SD_val;
+        PCT1_val = sum(differences < LoA_lower | differences > LoA_upper) / length(differences) * 100;
+    end
+    if isempty(differences)
+        D_max_abs_val = NaN;
+    else
+        D_max_abs_val = max(abs(differences));
+    end
+    MNE_val = mean((sim_data_valid + meas_data_valid) / 2);
+    if ~isnan(MNE_val) && MNE_val ~= 0 && ~isnan(D_max_abs_val)
+        PCT2_val = (D_max_abs_val / MNE_val) * 100;
+    else
+        if ~isnan(MNE_val) && MNE_val == 0
+            warning('MNE is zero. PCT2 cannot be calculated and is set to NaN.');
+        end
+        PCT2_val = NaN;
+    end
+end
